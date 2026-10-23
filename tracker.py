@@ -97,17 +97,32 @@ def parse_price(html):
     return None
 
 
+SESSION = requests.Session()  # keeps Amazon's cookies between requests, which looks less bot-like
+SESSION.headers.update(HEADERS)
+
+
+def get_page(url, params=None, expect=None, attempts=3):
+    """GET an amazon.eg page, waiting and retrying when Amazon throttles us (503, captcha,
+    or a stripped-down page missing `expect`)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=30)
+            if r.status_code == 200 and "validateCaptcha" not in r.text and (not expect or expect in r.text):
+                return r.text
+            problem = "captcha" if "validateCaptcha" in r.text else f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            problem = str(e)
+        if attempt < attempts:
+            time.sleep(random.uniform(20, 40) * attempt)
+    raise RuntimeError(f"blocked ({problem}) after {attempts} tries")
+
+
 def fetch(asin):
     """Return (title, price) or raise on a blocked/failed request. price is None if unavailable."""
-    url = f"https://www.amazon.eg/dp/{asin}?language=en_AE"
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    if "validateCaptcha" in r.text:
-        raise RuntimeError("blocked by captcha")
-    m = re.search(r'<span id="productTitle"[^>]*>\s*([^<]+?)\s*</span>', r.text)
+    page = get_page(f"https://www.amazon.eg/dp/{asin}", {"language": "en_AE"}, expect="productTitle")
+    m = re.search(r'<span id="productTitle"[^>]*>\s*([^<]+?)\s*</span>', page)
     title = html.unescape(m.group(1)) if m else asin
-    return title, parse_price(r.text)
+    return title, parse_price(page)
 
 
 def send(text):
@@ -190,18 +205,13 @@ def read_searches():
 
 def fetch_search(words, page):
     """Return [(asin, title, price)] for one page of amazon.eg search results."""
-    r = requests.get(
+    text = get_page(
         "https://www.amazon.eg/s",
-        params={"k": words, "page": page, "language": "en_AE"},
-        headers=HEADERS,
-        timeout=30,
+        {"k": words, "page": page, "language": "en_AE"},
+        expect="s-search-result",
     )
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    if "validateCaptcha" in r.text:
-        raise RuntimeError("blocked by captcha")
     results = []
-    blocks = re.split(r'(?=<div[^>]*data-asin="[A-Z0-9]{10}"[^>]*data-component-type="s-search-result")', r.text)
+    blocks = re.split(r'(?=<div[^>]*data-asin="[A-Z0-9]{10}"[^>]*data-component-type="s-search-result")', text)
     for block in blocks[1:]:
         asin = re.search(r'data-asin="([A-Z0-9]{10})"', block).group(1)
         # The first plain a-price is the selling price; "a-text-price" is the struck-through list price.
