@@ -15,8 +15,10 @@ Environment variables:
     TELEGRAM_CHAT_ID   your chat id (get it with --chat-id)
     DROP_PERCENT       alert when price falls this % below the last seen price (default 10)
     DISCOVER_DROP      searches mode: alert when price falls this % below its usual price (default 25)
-    LISTED_DISCOUNT    searches mode: alert when Amazon shows a discount of this % or more off
-                       the struck-through list price (default 50)
+    LISTED_DISCOUNT    searches mode: an advertised discount of this % or more off the
+                       struck-through price (default 50) also alerts, but only if ...
+    LISTED_VERIFY      ... the price really fell at least this % below its usual price (default 15),
+                       so fake "was" prices are ignored
     DATA_DIR           where price history is kept (default: next to this script)
 """
 
@@ -55,6 +57,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DROP_PERCENT = float(os.environ.get("DROP_PERCENT", "10"))
 DISCOVER_DROP = float(os.environ.get("DISCOVER_DROP", "25"))
 LISTED_DISCOUNT = float(os.environ.get("LISTED_DISCOUNT", "50"))
+LISTED_VERIFY = float(os.environ.get("LISTED_VERIFY", "15"))
 MIN_READINGS = 2        # earlier prices needed before a discovered product can alert
 MAX_ALERTS_PER_RUN = 15  # don't flood Telegram if something odd happens
 FORGET_AFTER_DAYS = 30   # drop discovered products not seen in search results for this long
@@ -317,23 +320,22 @@ def discover():
                 entry["seen"] = today
                 earlier = entry["prices"]
 
-                # Discount Amazon itself advertises (struck-through price). Needs no history.
+                entry.pop("listed_alerted", None)  # left over from older versions
+                # Discount Amazon advertises against its struck-through price.
                 off = 100 * (listed - price) / listed if listed and listed > price else 0
-                if off >= LISTED_DISCOUNT:
-                    if entry.get("listed_alerted") is None or price < entry["listed_alerted"]:
-                        alerts.append((off, asin, title, price, listed, "listed", image))
-                        entry["listed_alerted"] = price
-                        entry["alerted"] = price  # don't send the same deal again as a drop
-                else:
-                    entry.pop("listed_alerted", None)
 
                 if len(earlier) >= MIN_READINGS:
                     usual = statistics.median(earlier)
                     drop = 100 * (usual - price) / usual
-                    if drop >= DISCOVER_DROP:
+                    # A struck-through price alone can be fake (a "was" price the product never
+                    # sold at), so an advertised discount only counts if the price really fell
+                    # below what we've been seeing.
+                    real = drop >= DISCOVER_DROP or (off >= LISTED_DISCOUNT and drop >= LISTED_VERIFY)
+                    if real:
                         # Alert once per low price; a further drop alerts again.
                         if entry.get("alerted") is None or price < entry["alerted"]:
-                            alerts.append((drop, asin, title, price, usual, "drop", image))
+                            shown = listed if off >= LISTED_DISCOUNT else None
+                            alerts.append((drop, asin, title, price, usual, shown, image))
                             entry["alerted"] = price
                     else:
                         entry.pop("alerted", None)
@@ -346,18 +348,16 @@ def discover():
 
     alerts.sort(reverse=True)  # biggest discounts first
     alerts = [a for a in alerts if not already_sent(a[1], a[3])]
-    for pct, asin, title, price, before, kind, image in alerts[:MAX_ALERTS_PER_RUN]:
-        if kind == "listed":
-            head = f"🏷️ خصم {pct:.0f}% معلن على أمازون"
-            was = f"السعر قبل الخصم: {before:,.2f} جنيه"
-        else:
-            head = f"🔥 نزل {pct:.0f}% عن سعره المعتاد"
-            was = f"سعره المعتاد: {before:,.2f} جنيه"
+    for drop, asin, title, price, usual, listed, image in alerts[:MAX_ALERTS_PER_RUN]:
+        claimed = ""
+        if listed:
+            claimed = f"🏷️ أمازون كاتب خصم {100 * (listed - price) / listed:.0f}% (من {listed:,.2f} جنيه)\n"
         notify(
             asin,
             price,
-            f"{head}\n\n{title[:120]}\n\n"
-            f"السعر دلوقتي: {price:,.2f} جنيه\n{was}\n"
+            f"🔥 نزل فعلاً {drop:.0f}% عن سعره المعتاد\n\n{title[:120]}\n\n"
+            f"السعر دلوقتي: {price:,.2f} جنيه\n"
+            f"سعره المعتاد: {usual:,.2f} جنيه\n{claimed}"
             f"https://www.amazon.eg/dp/{asin}",
             image,
         )
