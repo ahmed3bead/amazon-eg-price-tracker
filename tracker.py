@@ -39,6 +39,8 @@ PRODUCTS_FILE = BASE / "products.txt"
 SEARCHES_FILE = BASE / "searches.txt"
 STATE_FILE = DATA / "prices.json"
 DISCOVER_FILE = DATA / "discovered.json"
+# Deals already sent, shared through the git repo by the PC and GitHub runs so neither repeats the other.
+SENT_FILE = BASE / "sent.json"
 
 HEADERS = {
     "User-Agent": (
@@ -56,6 +58,39 @@ LISTED_DISCOUNT = float(os.environ.get("LISTED_DISCOUNT", "50"))
 MIN_READINGS = 2        # earlier prices needed before a discovered product can alert
 MAX_ALERTS_PER_RUN = 15  # don't flood Telegram if something odd happens
 FORGET_AFTER_DAYS = 30   # drop discovered products not seen in search results for this long
+SENT_DAYS = 3            # a deal sent within this many days isn't sent again unless the price drops further
+
+SENT = {}
+
+
+def load_sent():
+    global SENT
+    SENT = json.loads(SENT_FILE.read_text(encoding="utf-8")) if SENT_FILE.exists() else {}
+
+
+def save_sent():
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=SENT_DAYS)).strftime("%Y-%m-%d")
+    kept = {a: v for a, v in sorted(SENT.items()) if v[1] >= cutoff}
+    # One deal per line keeps git merges simple.
+    text = "{\n" + ",\n".join(f'"{a}": {json.dumps(v)}' for a, v in kept.items()) + "\n}\n"
+    if not SENT_FILE.exists() or SENT_FILE.read_text(encoding="utf-8") != text:
+        SENT_FILE.write_text(text, encoding="utf-8")
+
+
+def already_sent(asin, price):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=SENT_DAYS)).strftime("%Y-%m-%d")
+    entry = SENT.get(asin)
+    return bool(entry) and entry[1] >= cutoff and price >= entry[0] - 0.01
+
+
+def notify(asin, price, text, image=None):
+    """Send an alert unless this deal (same or lower price) already went out recently."""
+    if already_sent(asin, price):
+        print(f"{asin}: already sent at {SENT[asin][0]:,.2f}, skipping")
+        return False
+    send(text, image)
+    SENT[asin] = [price, datetime.now(timezone.utc).strftime("%Y-%m-%d")]
+    return True
 
 
 def read_products():
@@ -195,7 +230,9 @@ def check():
 
         if reason:
             old = f"\nكان: {last:,.2f} جنيه" if last else ""
-            send(
+            notify(
+                asin,
+                price,
                 f"🔔 {reason}\n\n{title[:120]}\n\n"
                 f"السعر دلوقتي: {price:,.2f} جنيه{old}\n"
                 f"https://www.amazon.eg/dp/{asin}",
@@ -308,6 +345,7 @@ def discover():
     print(f"discovery: tracking {len(state)} products, {len(alerts)} alert(s)")
 
     alerts.sort(reverse=True)  # biggest discounts first
+    alerts = [a for a in alerts if not already_sent(a[1], a[3])]
     for pct, asin, title, price, before, kind, image in alerts[:MAX_ALERTS_PER_RUN]:
         if kind == "listed":
             head = f"🏷️ خصم {pct:.0f}% معلن على أمازون"
@@ -315,7 +353,9 @@ def discover():
         else:
             head = f"🔥 نزل {pct:.0f}% عن سعره المعتاد"
             was = f"سعره المعتاد: {before:,.2f} جنيه"
-        send(
+        notify(
+            asin,
+            price,
             f"{head}\n\n{title[:120]}\n\n"
             f"السعر دلوقتي: {price:,.2f} جنيه\n{was}\n"
             f"https://www.amazon.eg/dp/{asin}",
@@ -341,5 +381,9 @@ if __name__ == "__main__":
         send("✅ البوت شغال وهيبعتلك لما الأسعار تنزل")
     else:
         DATA.mkdir(parents=True, exist_ok=True)
-        check()
-        discover()
+        load_sent()
+        try:
+            check()
+            discover()
+        finally:
+            save_sent()

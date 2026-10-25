@@ -16,11 +16,24 @@ $env:PYTHONIOENCODING = "utf-8"
 # Tell the GitHub backup to sit out while the PC is on duty.
 gh variable set LAST_PC_RUN --body ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) 2>&1 | Out-Null
 
-# Pick up edits made on GitHub (searches.txt, products.txt, code).
-git pull -q --ff-only 2>&1 | Out-Null
+# Pick up edits made on GitHub (searches.txt, products.txt, code) and deals GitHub already sent.
+# "-X theirs" keeps this PC's sent.json lines if both sides touched the same ones.
+git pull -q --rebase -X theirs 2>&1 | Out-Null
 
 "===== $(Get-Date -Format 'yyyy-MM-dd HH:mm') =====" | Add-Content $log -Encoding utf8
 & python tracker.py 2>&1 | ForEach-Object { "$_" } | Add-Content $log -Encoding utf8
+
+# Share the deals this run sent, so the GitHub backup won't send them again.
+git add sent.json 2>&1 | Out-Null
+git diff --cached --quiet
+if ($LASTEXITCODE -ne 0) {
+    git -c user.name="price-bot-pc" -c user.email="price-bot@users.noreply.github.com" commit -q -m "Sent deals (PC)" 2>&1 | Out-Null
+    git push -q 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        git pull -q --rebase -X theirs 2>&1 | Out-Null
+        git push -q 2>&1 | Out-Null
+    }
+}
 
 # Keep the log small.
 $lines = Get-Content $log -Encoding utf8
