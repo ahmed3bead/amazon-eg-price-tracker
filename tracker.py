@@ -59,6 +59,8 @@ DISCOVER_DROP = float(os.environ.get("DISCOVER_DROP", "25"))
 LISTED_DISCOUNT = float(os.environ.get("LISTED_DISCOUNT", "50"))
 LISTED_VERIFY = float(os.environ.get("LISTED_VERIFY", "15"))
 MIN_READINGS = 2        # earlier prices needed before a discovered product can alert
+MIN_DAYS = 3            # days of history needed before the 30-day usual price takes over
+HISTORY_DAYS = 30       # how far back the usual price looks
 MAX_ALERTS_PER_RUN = 15  # don't flood Telegram if something odd happens
 FORGET_AFTER_DAYS = 30   # drop discovered products not seen in search results for this long
 SENT_DAYS = 3            # a deal sent within this many days isn't sent again unless the price drops further
@@ -91,7 +93,8 @@ def notify(asin, price, text, image=None):
     if already_sent(asin, price):
         print(f"{asin}: already sent at {SENT[asin][0]:,.2f}, skipping")
         return False
-    send(text, image)
+    # Kanbkam keeps years of amazon.eg price history, handy for checking a deal by eye.
+    send(f"{text}\n📊 تاريخ السعر على كان بكام:\nhttps://www.kanbkam.com/eg/ar/x-{asin}", image)
     SENT[asin] = [price, datetime.now(timezone.utc).strftime("%Y-%m-%d")]
     return True
 
@@ -296,6 +299,7 @@ def discover():
     state = json.loads(DISCOVER_FILE.read_text(encoding="utf-8")) if DISCOVER_FILE.exists() else {}
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
+    month_ago = (now - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
     alerts = []
     seen = set()
     first = True
@@ -319,13 +323,23 @@ def discover():
                 entry["title"] = title
                 entry["seen"] = today
                 earlier = entry["prices"]
+                daily = [d for d in entry.get("daily", []) if d[0] >= month_ago]
 
                 entry.pop("listed_alerted", None)  # left over from older versions
                 # Discount Amazon advertises against its struck-through price.
                 off = 100 * (listed - price) / listed if listed and listed > price else 0
 
-                if len(earlier) >= MIN_READINGS:
+                # Usual price: median of one price per day over the past 30 days. Until a product
+                # has a few days of history, fall back to its most recent readings.
+                past_days = [p for d, p in daily if d < today]
+                if len(past_days) >= MIN_DAYS:
+                    usual = statistics.median(past_days)
+                elif len(earlier) >= MIN_READINGS:
                     usual = statistics.median(earlier)
+                else:
+                    usual = None
+
+                if usual:
                     drop = 100 * (usual - price) / usual
                     # A struck-through price alone can be fake (a "was" price the product never
                     # sold at), so an advertised discount only counts if the price really fell
@@ -340,6 +354,12 @@ def discover():
                     else:
                         entry.pop("alerted", None)
                 entry["prices"] = (earlier + [price])[-30:]
+                # Keep the day's latest price, one entry per day.
+                if daily and daily[-1][0] == today:
+                    daily[-1][1] = price
+                else:
+                    daily.append([today, price])
+                entry["daily"] = daily
 
     cutoff = (now - timedelta(days=FORGET_AFTER_DAYS)).strftime("%Y-%m-%d")
     state = {a: e for a, e in state.items() if e.get("seen", today) >= cutoff}
