@@ -122,20 +122,35 @@ def get_page(url, params=None, expect=None, attempts=3):
     raise RuntimeError(f"blocked ({problem}) after {attempts} tries")
 
 
+def image_url(src):
+    """Turn an Amazon thumbnail URL into an 800px version that looks good in Telegram."""
+    if not src:
+        return None
+    return re.sub(r"\._[^/]*_\.(jpg|png)$", r"._AC_SL800_.\1", src)
+
+
 def fetch(asin):
-    """Return (title, price) or raise on a blocked/failed request. price is None if unavailable."""
+    """Return (title, price, image) or raise on a blocked/failed request. price is None if unavailable."""
     page = get_page(f"https://www.amazon.eg/dp/{asin}", {"language": "en_AE"}, expect="productTitle")
     m = re.search(r'<span id="productTitle"[^>]*>\s*([^<]+?)\s*</span>', page)
     title = html.unescape(m.group(1)) if m else asin
-    return title, parse_price(page)
+    tag = re.search(r'<img[^>]*id="landingImage"[^>]*>', page)
+    img = re.search(r'\ssrc="([^"]+)"', tag.group(0)) if tag else None
+    return title, parse_price(page), image_url(img.group(1) if img else None)
 
 
-def send(text):
+def send(text, image=None):
     if not TOKEN or not CHAT_ID:
-        print("[telegram not configured]", text)
+        print("[telegram not configured]", text, image or "")
         return
+    api = f"https://api.telegram.org/bot{TOKEN}"
+    if image:
+        r = requests.post(f"{api}/sendPhoto", data={"chat_id": CHAT_ID, "photo": image, "caption": text}, timeout=30)
+        if r.ok:
+            return
+        print("Telegram photo failed, sending text only:", r.text)
     r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        f"{api}/sendMessage",
         data={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": "true"},
         timeout=30,
     )
@@ -162,7 +177,7 @@ def check():
         if n:
             time.sleep(random.uniform(4, 9))  # be gentle, avoid looking like a bot
         try:
-            title, price = fetch(asin)
+            title, price, image = fetch(asin)
         except Exception as e:
             print(f"{asin}: failed ({e})")
             continue
@@ -183,7 +198,8 @@ def check():
             send(
                 f"🔔 {reason}\n\n{title[:120]}\n\n"
                 f"السعر دلوقتي: {price:,.2f} جنيه{old}\n"
-                f"https://www.amazon.eg/dp/{asin}"
+                f"https://www.amazon.eg/dp/{asin}",
+                image,
             )
 
         entry["last"] = price
@@ -209,7 +225,7 @@ def read_searches():
 
 
 def fetch_search(words, page):
-    """Return [(asin, title, price, list_price)] for one page of amazon.eg search results.
+    """Return [(asin, title, price, list_price, image)] for one page of amazon.eg search results.
     list_price is the struck-through "was" price, or None when Amazon shows no discount."""
     text = get_page(
         "https://www.amazon.eg/s",
@@ -228,7 +244,8 @@ def fetch_search(words, page):
         title = html.unescape(re.sub(r"<[^>]+>", "", h2.group(1)).strip()) if h2 else asin
         listed = re.search(r'<span class="a-price a-text-price"[^>]*>\s*<span class="a-offscreen">EGP\W*([\d,.]+)<', block)
         listed = float(listed.group(1).replace(",", "")) if listed else None
-        results.append((asin, title, float(price.group(1).replace(",", "")), listed))
+        img = re.search(r'<img[^>]*class="s-image"[^>]*\ssrc="([^"]+)"', block)
+        results.append((asin, title, float(price.group(1).replace(",", "")), listed, image_url(img.group(1) if img else None)))
     return results
 
 
@@ -254,7 +271,7 @@ def discover():
                 print(f"search '{words}' page {page}: failed ({e})")
                 break
             print(f"search '{words}' page {page}: {len(results)} products")
-            for asin, title, price, listed in results:
+            for asin, title, price, listed, image in results:
                 if asin in seen:  # same product can show up in several searches
                     continue
                 seen.add(asin)
@@ -267,7 +284,7 @@ def discover():
                 off = 100 * (listed - price) / listed if listed and listed > price else 0
                 if off >= LISTED_DISCOUNT:
                     if entry.get("listed_alerted") is None or price < entry["listed_alerted"]:
-                        alerts.append((off, asin, title, price, listed, "listed"))
+                        alerts.append((off, asin, title, price, listed, "listed", image))
                         entry["listed_alerted"] = price
                         entry["alerted"] = price  # don't send the same deal again as a drop
                 else:
@@ -279,7 +296,7 @@ def discover():
                     if drop >= DISCOVER_DROP:
                         # Alert once per low price; a further drop alerts again.
                         if entry.get("alerted") is None or price < entry["alerted"]:
-                            alerts.append((drop, asin, title, price, usual, "drop"))
+                            alerts.append((drop, asin, title, price, usual, "drop", image))
                             entry["alerted"] = price
                     else:
                         entry.pop("alerted", None)
@@ -291,7 +308,7 @@ def discover():
     print(f"discovery: tracking {len(state)} products, {len(alerts)} alert(s)")
 
     alerts.sort(reverse=True)  # biggest discounts first
-    for pct, asin, title, price, before, kind in alerts[:MAX_ALERTS_PER_RUN]:
+    for pct, asin, title, price, before, kind, image in alerts[:MAX_ALERTS_PER_RUN]:
         if kind == "listed":
             head = f"🏷️ خصم {pct:.0f}% معلن على أمازون"
             was = f"السعر قبل الخصم: {before:,.2f} جنيه"
@@ -301,7 +318,8 @@ def discover():
         send(
             f"{head}\n\n{title[:120]}\n\n"
             f"السعر دلوقتي: {price:,.2f} جنيه\n{was}\n"
-            f"https://www.amazon.eg/dp/{asin}"
+            f"https://www.amazon.eg/dp/{asin}",
+            image,
         )
 
 
