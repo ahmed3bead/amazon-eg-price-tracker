@@ -15,18 +15,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The PC runs every 15 minutes and records the time in the LAST_PC_RUN variable.
+      # While it is running, this hourly backup sits out so the same deal isn't sent twice.
+      - name: Skip if the PC is running
+        id: pc
+        run: |
+          last="${{ vars.LAST_PC_RUN }}"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -n "$last" ] && [ $(( $(date +%s) - last )) -lt 2700 ]; then
+            echo "PC ran $(( ($(date +%s) - last) / 60 )) minutes ago, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.pc.outputs.skip != 'true'
+        uses: actions/checkout@v4
+      - if: steps.pc.outputs.skip != 'true'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: python tracker.py
+      - if: steps.pc.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+      - if: steps.pc.outputs.skip != 'true'
+        run: python tracker.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DROP_PERCENT: "10"
-          DISCOVER_DROP: "40"
+          DISCOVER_DROP: "25"
+          LISTED_DISCOUNT: "50"
       - name: Save price history
+        if: steps.pc.outputs.skip != 'true'
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"

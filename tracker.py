@@ -14,7 +14,10 @@ Environment variables:
     TELEGRAM_TOKEN     bot token from @BotFather
     TELEGRAM_CHAT_ID   your chat id (get it with --chat-id)
     DROP_PERCENT       alert when price falls this % below the last seen price (default 10)
-    DISCOVER_DROP      searches mode: alert when price falls this % below its usual price (default 40)
+    DISCOVER_DROP      searches mode: alert when price falls this % below its usual price (default 25)
+    LISTED_DISCOUNT    searches mode: alert when Amazon shows a discount of this % or more off
+                       the struck-through list price (default 50)
+    DATA_DIR           where price history is kept (default: next to this script)
 """
 
 import html
@@ -31,10 +34,11 @@ from pathlib import Path
 import requests
 
 BASE = Path(__file__).parent
+DATA = Path(os.environ.get("DATA_DIR") or BASE)
 PRODUCTS_FILE = BASE / "products.txt"
-STATE_FILE = BASE / "prices.json"
 SEARCHES_FILE = BASE / "searches.txt"
-DISCOVER_FILE = BASE / "discovered.json"
+STATE_FILE = DATA / "prices.json"
+DISCOVER_FILE = DATA / "discovered.json"
 
 HEADERS = {
     "User-Agent": (
@@ -47,7 +51,8 @@ HEADERS = {
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DROP_PERCENT = float(os.environ.get("DROP_PERCENT", "10"))
-DISCOVER_DROP = float(os.environ.get("DISCOVER_DROP", "40"))
+DISCOVER_DROP = float(os.environ.get("DISCOVER_DROP", "25"))
+LISTED_DISCOUNT = float(os.environ.get("LISTED_DISCOUNT", "50"))
 MIN_READINGS = 2        # earlier prices needed before a discovered product can alert
 MAX_ALERTS_PER_RUN = 15  # don't flood Telegram if something odd happens
 FORGET_AFTER_DAYS = 30   # drop discovered products not seen in search results for this long
@@ -204,7 +209,8 @@ def read_searches():
 
 
 def fetch_search(words, page):
-    """Return [(asin, title, price)] for one page of amazon.eg search results."""
+    """Return [(asin, title, price, list_price)] for one page of amazon.eg search results.
+    list_price is the struck-through "was" price, or None when Amazon shows no discount."""
     text = get_page(
         "https://www.amazon.eg/s",
         {"k": words, "page": page, "language": "en_AE"},
@@ -220,7 +226,9 @@ def fetch_search(words, page):
             continue
         h2 = re.search(r"<h2[^>]*>([\s\S]{0,800}?)</h2>", block)
         title = html.unescape(re.sub(r"<[^>]+>", "", h2.group(1)).strip()) if h2 else asin
-        results.append((asin, title, float(price.group(1).replace(",", ""))))
+        listed = re.search(r'<span class="a-price a-text-price"[^>]*>\s*<span class="a-offscreen">EGP\W*([\d,.]+)<', block)
+        listed = float(listed.group(1).replace(",", "")) if listed else None
+        results.append((asin, title, float(price.group(1).replace(",", "")), listed))
     return results
 
 
@@ -246,7 +254,7 @@ def discover():
                 print(f"search '{words}' page {page}: failed ({e})")
                 break
             print(f"search '{words}' page {page}: {len(results)} products")
-            for asin, title, price in results:
+            for asin, title, price, listed in results:
                 if asin in seen:  # same product can show up in several searches
                     continue
                 seen.add(asin)
@@ -254,13 +262,24 @@ def discover():
                 entry["title"] = title
                 entry["seen"] = today
                 earlier = entry["prices"]
+
+                # Discount Amazon itself advertises (struck-through price). Needs no history.
+                off = 100 * (listed - price) / listed if listed and listed > price else 0
+                if off >= LISTED_DISCOUNT:
+                    if entry.get("listed_alerted") is None or price < entry["listed_alerted"]:
+                        alerts.append((off, asin, title, price, listed, "listed"))
+                        entry["listed_alerted"] = price
+                        entry["alerted"] = price  # don't send the same deal again as a drop
+                else:
+                    entry.pop("listed_alerted", None)
+
                 if len(earlier) >= MIN_READINGS:
                     usual = statistics.median(earlier)
                     drop = 100 * (usual - price) / usual
                     if drop >= DISCOVER_DROP:
                         # Alert once per low price; a further drop alerts again.
                         if entry.get("alerted") is None or price < entry["alerted"]:
-                            alerts.append((drop, asin, title, price, usual))
+                            alerts.append((drop, asin, title, price, usual, "drop"))
                             entry["alerted"] = price
                     else:
                         entry.pop("alerted", None)
@@ -271,12 +290,17 @@ def discover():
     DISCOVER_FILE.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     print(f"discovery: tracking {len(state)} products, {len(alerts)} alert(s)")
 
-    alerts.sort(reverse=True)  # biggest drops first
-    for drop, asin, title, price, usual in alerts[:MAX_ALERTS_PER_RUN]:
+    alerts.sort(reverse=True)  # biggest discounts first
+    for pct, asin, title, price, before, kind in alerts[:MAX_ALERTS_PER_RUN]:
+        if kind == "listed":
+            head = f"🏷️ خصم {pct:.0f}% معلن على أمازون"
+            was = f"السعر قبل الخصم: {before:,.2f} جنيه"
+        else:
+            head = f"🔥 نزل {pct:.0f}% عن سعره المعتاد"
+            was = f"سعره المعتاد: {before:,.2f} جنيه"
         send(
-            f"🔥 عرض لقيته لوحدي: نزل {drop:.0f}% عن سعره المعتاد\n\n{title[:120]}\n\n"
-            f"السعر دلوقتي: {price:,.2f} جنيه\n"
-            f"سعره المعتاد: {usual:,.2f} جنيه\n"
+            f"{head}\n\n{title[:120]}\n\n"
+            f"السعر دلوقتي: {price:,.2f} جنيه\n{was}\n"
             f"https://www.amazon.eg/dp/{asin}"
         )
 
@@ -298,5 +322,6 @@ if __name__ == "__main__":
     elif "--test" in sys.argv:
         send("✅ البوت شغال وهيبعتلك لما الأسعار تنزل")
     else:
+        DATA.mkdir(parents=True, exist_ok=True)
         check()
         discover()
